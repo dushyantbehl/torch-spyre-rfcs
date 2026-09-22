@@ -18,8 +18,14 @@ to provide input to `spyre-cli`:
 * **The OpSpec Lab** (`tests/op_specs/`, and its related PR #4060)
   captures a per-kernel replay script from `torch.compile`, carrying shapes,
   layouts, and pool size.
-* **sdsc-launcher**, an *internal repo* which reconstructs a `LaunchPlan` from `bundle.mlir` plus
-  `sdsc_*.json` to launch the bundle on device.
+* **Reconstructing the launch plan from the compiled artifacts.** Rather than
+  being told the tensor interface, a launcher can parse `bundle.mlir` and
+  `sdsc_*.json` and infer it: operation order, tensor roles, dimensions,
+  layouts, and allocation addresses, resolving symbolic addresses and external
+  inputs and outputs from producer/consumer flow. This needs no PyTorch and no
+  extra file, and it is a proven approach — but it re-derives what the compiler
+  already knew, and a PyTorch-side implementation would mean a second
+  MLIR/SDSC parser to keep in step with the emitters.
 
 In PR #4290 we shipped the inline-string form as an interim step.
 In the PR #4077 we converged on compiler-emitted I/O metadata,
@@ -340,8 +346,9 @@ replaces the other.
 ## **Alternatives**
 
 * **Query the compiled artifacts at launch.** Have the CLI parse
-  `spyrecode.json` / `bundle.mlir` directly, as sdsc-launcher does, so no new
-  file is needed. This is the most appealing alternative: single source of
+  `spyrecode.json` / `bundle.mlir` directly and infer the interface, the
+  reconstruct-the-launch-plan approach described in the Summary, so no new file
+  is needed. This is the most appealing alternative: single source of
   truth, nothing to keep in sync. Rejected for now because it puts a second
   MLIR/SDSC parser into the Python path and re-derives what the compiler
   already knew; the existing `spyrecode.json` carries `JobPreparationPlan` and
@@ -380,9 +387,10 @@ Out of scope:
 
 * Numerical validation and reference-result checking; the spec makes launches
   well-formed, not correct.
-* Teaching sdsc-launcher to read the spec. Worth doing — it would give the
-  three mechanisms one shared vocabulary — but it is a C++ change with its own
-  constraints and should be its own RFC.
+* Teaching a standalone (non-PyTorch) launcher to read the spec instead of
+  reconstructing the interface itself. Worth doing — it would give every
+  mechanism one shared vocabulary — but it is out of this repo's scope and
+  should be its own RFC.
 * Any change to how `torch.compile` lowers or schedules.
 
 ## Resolution

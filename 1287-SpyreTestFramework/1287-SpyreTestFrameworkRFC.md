@@ -50,10 +50,45 @@ The Spyre framework hooks into this mechanism via `SpyreTestBase` (which can eve
 1. Loads the YAML config on first `instantiate_test` call
 2. Patches `@ops.op_list` directly to restrict which ops generate variants (`_OOTOpListPatcher`)
 3. Patches `@onlyOn` to allow the `spyre` device type (`_OOTOnlyOnPatcher`)
-4. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
-5. Applies skip, xfail, or mandatory_success to each generated variant
-6. Adds custom markers to tests for provenance
-7. Injects custom input arguments at test call time
+4. Patches `@onlyNativeDeviceTypes` and `@onlyNativeDeviceTypesAnd` to include
+   `"privateuse1"` in `NATIVE_DEVICES` (`_OOTNativeDeviceTypesPatcher`)
+5. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
+6. Applies skip, xfail, or mandatory_success to each generated variant
+7. Adds custom markers to tests for provenance
+8. Injects custom input arguments at test call time
+
+### 2.3 The `@onlyNativeDeviceTypes` / `@onlyNativeDeviceTypesAnd` problem
+
+Two upstream decorators restrict tests to a hardcoded set of "native" devices:
+
+```python
+NATIVE_DEVICES = ('cpu', 'cuda', 'xpu', 'meta', 'mps', 'mtia',
+                  torch._C._get_privateuse1_backend_name())
+```
+
+Although `NATIVE_DEVICES` already includes the registered backend name (e.g.
+`"spyre"`), `TorchTestBase.setUpClass` resets `cls.device_type` to the literal
+string `"privateuse1"` so that `PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1`
+filters work correctly. At test runtime the decorator therefore sees
+`self.device_type == "privateuse1"`, which is **not** in `NATIVE_DEVICES`, and
+raises `unittest.SkipTest`.
+
+`_OOTNativeDeviceTypesPatcher` fixes this by appending `"privateuse1"` to the
+`NATIVE_DEVICES` tuple in the `common_device_type` module namespace once per
+process, before any test variant runs:
+
+```python
+class _OOTNativeDeviceTypesPatcher:
+    @staticmethod
+    def patch() -> None:
+        import torch.testing._internal.common_device_type as _cdt
+        if "privateuse1" not in _cdt.NATIVE_DEVICES:
+            _cdt.NATIVE_DEVICES = _cdt.NATIVE_DEVICES + ("privateuse1",)
+```
+
+The patch is called at the top of `instantiate_test` alongside
+`_OOTOnlyOnPatcher`. Because it is idempotent, repeated calls across many
+`instantiate_test` invocations are safe.
 
 ---
 
@@ -194,7 +229,7 @@ tests:
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test |
+| `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test. Supports regex patterns in the method name part, matched via `re.fullmatch` against the full instantiated method name. Since parametrized tests have suffixes appended (e.g. `test_sqrt_1d_abs_spyre`), patterns must end with `.*` unless targeting a standalone non-parametrized test. Examples: `TestOps::test_rope_fms_.*`, `TestOps::test_(sqrt|rsqrt|log).*` |
 | `mode` | No | `mandatory_success` | How to treat this test's variants |
 | `tags` | No | `[]` | Pytest mark labels applied to all variants of this test |
 | `selectors` | No | — | Per-test filtering criteria. Replaces the former top-level `test_selectors`. Same schema — see §5.4 |
@@ -243,10 +278,10 @@ Marker naming convention:
 - Op name: `torch.nn.functional.embedding` -> `op__torch_nn_functional_embedding`
 - Dtype: `torch.float16` -> `dtype__float16`
 - Module name: `nn.BatchNorm2d` -> `module__nn_BatchNorm2d`
+- Platform architecture: `x86_64` -> `platform__x86_64`, `ppc64le` -> `platform__ppc64le`
 
-Prefixes (`op__`, `dtype__`, `module__`) make the marker type unambiguous and prevent
-collisions between op names, dtype names, and module names that might otherwise overlap.
-
+Prefixes (`op__`, `dtype__`, `module__`, `platform__`) make the marker type unambiguous and prevent
+collisions between op names, dtype names, module names, and platform identifiers that might otherwise overlap.
 This enables filtering by specific op, dtype, or module without modifying the YAML config:
 
 ```bash
@@ -276,12 +311,50 @@ bash run_test.sh configs/example_test_config.yaml -v -m "module__nn_Linear and d
 
 # Collect only for modules
 bash run_test.sh configs/example_test_config.yaml -v -m "module__nn_BatchNorm2d" --collect-only
+
+# Run all tests on a specific platform architecture
+bash run_test.sh configs/example_test_config.yaml -v -m "platform__x86_64"
+
+# Combine platform with op filter
+bash run_test.sh configs/gpt_oss_20b_spyre.yaml -v -m "platform__ppc64le and op__torch_add"
+
+# Combine platform with dtype and YAML-defined tag
+bash run_test.sh configs/gpt_oss_20b_spyre.yaml -v -m "platform__x86_64 and dtype__float16 and model_1"
 ```
+
 
 Note: Dots in op and module names are replaced with underscores since pytest markers do
 not support dots. The mapping is 1:1 - `op__torch_nn_functional_embedding` always refers
 to `torch.nn.functional.embedding`, and `module__nn_BatchNorm2d` always refers to
-`nn.BatchNorm2d` (the short name used by upstream `module_info.name`).
+`nn.BatchNorm2d` (the short name used by upstream `module_info.name`). Platform markers
+are derived from `platform.machine()` with non-alphanumeric characters replaced by
+underscores — the marker is constant for the lifetime of the process and identical across
+all variants in a test run.
+
+#### Platform-specific slow test tags
+
+Some tests are prohibitively slow on specific hardware architectures. The framework
+supports static `slow_<arch>` tags declared in the YAML config to suppress these tests
+automatically on the affected platform — no command-line flags required.
+
+Supported slow tags:
+
+| Tag | Platform | `uname -m` |
+|---|---|---|
+| `slow__plat_ppc64` | IBM Power (ppc64le) | `ppc64*` |
+| `slow__plat_s390x` | IBM Z (s390x) | `s390x*` |
+| `slow__plat_aarch64` | ARM 64-bit | `aarch64`, `arm64` |
+
+When `run_test.sh` detects a non-x86_64 platform at startup, it automatically injects
+`-m "not slow_<arch>"` into the pytest invocation. On x86_64 (the baseline CI platform)
+no filtering is applied. The log line confirms what happened:
+
+```bash
+On ppc64le:
+[torch_oot_device_tests_run] Platform ppc64le: auto-skipping tests tagged 'slow__plat_ppc64'
+On x86_64:
+[torch_oot_device_tests_run] Platform x86_64: no slow tag defined, all tests will run
+```
 
 ### 5.3 Edits
 
@@ -1145,6 +1218,28 @@ Use a weight matrix captured during model tracing as exact input, avoiding any s
 
 ---
 
+### 8.16 Skip slow tests automatically on IBM Power and IBM Z
+
+Large matmul tests with shapes like `M2048_K2048_N65536` are prohibitively slow on
+IBM Power (ppc64le) and IBM Z (s390x) hardware. Tag them in the YAML config once —
+`run_test.sh` auto-skips them on the affected platform with no flags required:
+
+```yaml
+- names:
+    - TestOps::test_large_matmul_matmul_2d_M2048_K2048_N65536
+    - TestOps::test_large_matmul_matmul_3d_M3_K11_N2880
+    - TestOps::test_large_matmul_matmul_3d2d_M3_K11_N2880
+    - TestOps::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536
+  mode: mandatory_success
+  tags:
+    - ops__inductor-matmul
+    - slow__plat_ppc64    # auto-skipped on IBM Power (ppc64le)
+    - slow__plat_s390x    # auto-skipped on IBM Z (s390x)
+```
+
+On x86_64 these tests run normally — the tags are ignored on platforms that have
+no matching slow filter.
+
 ## 9. Field Reference Summary
 
 ### File entry
@@ -1159,7 +1254,7 @@ Use a weight matrix captured during model tracing as exact input, avoiding any s
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `names` | list of strings | Yes | — |
+| `names` | list of strings | Yes | — | Each string is `ClassName::method_name`; the method name part supports regex patterns matched via `re.fullmatch` at collection time. Parametrized test patterns must end with `.*` |
 | `mode` | enum | No | `mandatory_success` |
 | `tags` | list of strings | No | `[]` |
 | `selectors` | selector dict | No | — | [Planned] |
@@ -1252,7 +1347,7 @@ Exactly one key per element:
 
 ## 10. Validation Rules
 
-1. `names` must match `ClassName::method_name` pattern
+1. `names` must match `ClassName::method_name` pattern. The method name part may contain regex metacharacters; patterns are matched using `re.fullmatch` against the full instantiated test name at collection time. Since parametrized tests have suffixes appended by the PARAMS system (e.g. `test_sqrt_1d_abs_spyre`), patterns targeting parametrized tests **must end with `.*`**. Patterns without `.*` only match standalone non-parametrized tests whose name has no suffix (e.g. `test_bool`, `test_matmul_tiled_y`). Examples: `TestOps::test_rope_fms_.*` matches all rope fms variants; `TestOps::test_(sqrt|rsqrt|log).*` matches all sqrt, rsqrt, and log variants; `TestOps::test_bool` matches only the exact standalone test.
 2. `mode` and `unlisted_test_mode` must be one of `mandatory_success`, `xfail`, `xfail_strict`, `skip`
 3. All dtype strings must be valid PyTorch dtype names
 4. `edits.dtypes.include` may be subset of `global.supported_dtypes` or mutually exclusive to `global.supported_dtypes`
@@ -1466,6 +1561,8 @@ test_suite_config:
         - names:
             - TestBinaryUfuncs::test_scalar_support
             - TestBinaryUfuncs::test_contig_vs_transposed
+            - TestBinaryUfuncs::test_scalar_*
+            - TestBinaryUfuncs::test_(add|mul).* # regex: matches test_add_* and test_mul_* variants
 
           mode: xfail
 
@@ -1676,10 +1773,22 @@ test_suite_config:
 - Global supported ops and dtypes
 - Force xfail at op level
 - Precision overrides per op/dtype
-- Dynamic pytest markers for op name, dtype, and module name with typed prefixes
-  (`op__`, `dtype__`, `module__`), enabling filtering like
-  `pytest -m "op__torch_add"`, `pytest -m "dtype__float16"`,
-  and `pytest -m "module__nn_BatchNorm2d"` without any YAML configuration
+- `@onlyNativeDeviceTypes` and `@onlyNativeDeviceTypesAnd` patching via
+  `_OOTNativeDeviceTypesPatcher`: injects `"privateuse1"` into the module-level
+  `NATIVE_DEVICES` tuple in `torch.testing._internal.common_device_type` so that
+  tests guarded by these decorators are not skipped when `self.device_type` is
+  `"privateuse1"` at runtime
+- Dynamic pytest markers for op name, dtype, module name, and platform architecture
+  with typed prefixes (`op__`, `dtype__`, `module__`, `platform__`), enabling filtering
+  like `pytest -m "op__torch_add"`, `pytest -m "dtype__float16"`,
+  `pytest -m "module__nn_BatchNorm2d"`, and `pytest -m "platform__x86_64"` without any
+  YAML configuration. The `platform__` marker is resolved once from `platform.machine()`
+  at import time and attached to every test variant unconditionally
+- Platform-aware slow test suppression via static `slow_<arch>` YAML tags
+  (`slow__plat_ppc64` for IBM Power, `slow__plat_s390x` for IBM Z, `slow__plat_aarch64` for ARM).
+  `run_test.sh` detects the current architecture via `uname -m` at startup and
+  automatically injects `-m "not slow_<arch>"` on non-x86_64 platforms. Adding a
+  slow test to a new platform requires only a YAML tag entry — no code changes
 
 ### Phase 2: Current (In progress)
   - Per-test input argument specification via `edits.inputs`
@@ -1753,6 +1862,12 @@ pytest test_model_ops_v2.py -m "op__torch_add and dtype__float16"
 
 # Combine module + dtype
 pytest test_modules.py -m "module__nn_Linear and dtype__float32"
+
+# Combine with YAML tags
+pytest test_model_ops_v2.py -m "gpt-oss-20b and op__torch_nn_functional_embedding"
+
+# Combine platform with op
+pytest test_model_ops_v2.py -m "platform__ppc64le and op__torch_add"
 
 # Combine with YAML tags
 pytest test_model_ops_v2.py -m "gpt-oss-20b and op__torch_nn_functional_embedding"

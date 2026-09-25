@@ -10,7 +10,7 @@
 Launching an already-compiled SpyreCode directory today with [spyre-cli](https://github.com/torch-spyre/torch-spyre/tree/main/extensions/spyre-cli)
 requires the caller to retype tensor shapes and dtypes that the compiler already knew.
 Current `spyre-cli` takes [inline strings](https://github.com/torch-spyre/torch-spyre/tree/main/extensions/spyre-cli#cli) such as `-i 10x512@fp16` and builds tensors positionally.
-Three mechanisms overlap in this space, and were discussed on PR #4077 as ways
+Two mechanisms overlap in this space, and were discussed on PR #4077 as ways
 to provide input to `spyre-cli`:
 
 * **A human-authored IOSpec JSON** was proposed in #4077 but closed in favour of
@@ -18,21 +18,13 @@ to provide input to `spyre-cli`:
 * **The OpSpec Lab** (`tests/op_specs/`, and its related PR #4060)
   captures a per-kernel replay script from `torch.compile`, carrying shapes,
   layouts, and pool size.
-* **Reconstructing the launch plan from the compiled artifacts.** Rather than
-  being told the tensor interface, a launcher can parse `bundle.mlir` and
-  `sdsc_*.json` and infer it: operation order, tensor roles, dimensions,
-  layouts, and allocation addresses, resolving symbolic addresses and external
-  inputs and outputs from producer/consumer flow. This needs no PyTorch and no
-  extra file, and it is a proven approach — but it re-derives what the compiler
-  already knew, and a PyTorch-side implementation would mean a second
-  MLIR/SDSC parser to keep in step with the emitters.
 
 In PR #4290 we shipped the inline-string form as an interim step.
 In the PR #4077 we converged on compiler-emitted I/O metadata,
 across both emitters, as the right answer.
 This RFC is the design that #4077's review explicitly deferred.
 
-We propose a **Launch Spec**: a single declarative JSON contract,
+We propose a `launch spec`: a single declarative JSON contract,
 emitted by the compiler at build time and consumed by `spyre-cli`, that
 describes every argument of every kernel in a SpyreCode folder.
 We plan to design the spec so that a KTIR-emitted folder is describable in the
@@ -55,29 +47,40 @@ Inside the `spyre-cli` README we had stated the problem which is,
 > 1. You need to pass the right input and output list.
 > 2. If the shapes don't match, there is no error - the code will silently work.
 
-This is because `launch_from_cli` (`spyre_cli/core.py:74-104`) creates tensors purely from the user's strings,
-appends them input-then-output into one flat list, and passes them to
-`SpyreSDSCKernelRunner.run(*tensors)`.
+This is because the current code creates tensors purely from
+the user's input and passes them to `SpyreSDSCKernelRunner.run(*tensors)`
+without checking what the compiled kernel expects.
 
-Nowhere we check what the compiled kernel expects. As example, a transposed pair of dimensions
-produces a launch, not an error, and the printed output tensor looks plausible.
+This was reproduced on hardware. A `[10, 512]` fp16 `add` was compiled with
+`torch.compile`, then launched four ways through `spyre launch` against the
+resulting folder:
 
-The launch path also has no backstop. `SpyreStream::launch`
-(`torch_spyre/csrc/spyre_stream.cpp:277-283`) validates exactly one property per argument:
+| Launch | Result |
+|---|---|
+| `-i 10x512@fp16 -i 10x512@fp16 -o 10x512@fp16` (correct) | works, prints all `2.0` |
+| `-i 512x10@fp16 ...` (transposed) | **launches, exit 0, wrong data** |
+| `-i 10x512@fp32 ...` (wrong dtype) | **launches, exit 0, wrong data** |
+| one input instead of two (wrong count) | fails with a clear error |
 
-```cpp
-for (size_t i = 0; i < args.size(); ++i) {
-  TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
-              " must be on Spyre device, got ", args[i].device());
-}
+The two silent cases are worse than "garbage out". The transposed launch printed
+`2.0` for its leading rows and `-1.3008e-03` further down; the fp32 launch mixed
+`1.6000e+01` with `-3.0316e-13`. Partially-correct output is is not correct and users
+may fail to see when eyeballing them easily.
+
+If the tensor count is wrong its already caught deeper in the stack:
+
+```text
+RuntimeError: DtException: Number of inputs provided (2) does not match
+number of inputs expected (3) ... DataConvertInfoGenerate.cpp line 39
 ```
 
-We do not check anything like count, order, dtype, shape which is a limitation of `spyre-cli` and more importantly a potential problem.
-We should note here that **the compiled bundle is the source of truth for argument identity and order.**
+Even if count is enforced, shape and dtype are not making those as the two
+which users can most likely get wrong.
+
+The compiled bundle is the source of truth for argument identity and order.
 Any second, human-maintained copy of that contract can only drift from it, and
 requires extra work to create in the first place.
-To make `spyre-cli` a useful tool for debugging compiled code, we need to fix
-this.
+To make `spyre-cli` a useful tool for debugging compiled code, we need to fix this.
 
 ### How spyre-cli uses kernel runner
 
@@ -99,16 +102,13 @@ We need to enable the two additional parameters because:
 
 * **`symbol_kinds`** is the canonical symbol order returned by
   `generate_bundle()`. When it is absent, `_symbolic_args` is set to `None`
-  (`kernel_runner.py:118-119`), and `run` takes the two-argument
+  (`kernel_runner.py:118-119`) and `run` takes the two-argument
   `launch_jobplan(self.jobplan, args)` branch (`kernel_runner.py:147-150`).
-  So every `spyre-cli` launch silently runs without the `SymbolicArg` address
-  payload. Since `config.bundle_symbolic_args` defaults to **on**
-  (`_inductor/config.py:245`, `BUNDLE_SYMBOLIC_ARGS=1`), `spyre-cli` is
-  launching bundles in a mode the default compile path does not use. Any
-  bundle whose symbol table needs `kAddress` binding — the pool parameter case
-  at `kernel_runner.py:96-111`, the `kernel_slice` and `kernel_derived`
-  variants documented at `codegen/compute_ops.py:37-53` — is not reachable
-  from the CLI today.
+  The simple `add` above needs nothing more, so this is not a gap for every
+  kernel — but a bundle whose symbol table needs `kAddress` binding (the pool
+  parameter at `kernel_runner.py:96-111`, or the `kernel_slice` /
+  `kernel_derived` variants at `codegen/compute_ops.py:37-53`) is not
+  launchable from the CLI today.
 * **`kernel_provenance`** is what populates `profiler_event_name` and drives
   `register_kernel_provenance`, so CLI launches cannot be joined to profiler
   traces.
@@ -139,70 +139,99 @@ The problem is that this is presented only by a separate script and
 the contract right now is produced only by a capture run, not by an ordinary compile.
 
 There is also a second emitter arriving: KTIR (`config.ktir_emitter`,
-`TORCH_SPYRE_KTIR=1`), which writes `<kernel>.ktir` at
-`execution/async_compile.py:456`. If the launch contract is not defined
-emitter-neutrally before KTIR folders become common, we will end up with two
-incompatible ad-hoc input paths instead of one.
+`TORCH_SPYRE_KTIR=1`). It produces the same kind of loadable folder, so if the
+launch contract is not defined emitter-neutrally before KTIR folders become
+common, we will end up with two incompatible ad-hoc input paths instead of one.
 
 ## **Proposed Implementation**
 
 ### The Launch Spec
 
-One `launch_spec.json` written at the root of a SpyreCode output directory,
-beside the existing per-kernel `spyreCodeDir/`:
+One `launch_spec.json` per kernel, written beside that kernel's
+`spyreCodeDir/`:
 
 ```json
 {
   "version": 1,
+  "kernel_name": "sdsc_fused_add_0",
+  "pool_size": 0,
+  "bundle_symbolic_args": true,
   "emitter": "sdsc",
-  "kernels": [
-    {
-      "name": "sdsc_fused_add_0",
-      "code_dir": "sdsc_fused_add_0",
-      "pool_size": 0,
-      "bundle_symbolic_args": true,
-      "symbol_kinds": [
-        {"kind": "kernel", "arg_index": 0},
-        {"kind": "kernel", "arg_index": 1},
-        {"kind": "kernel", "arg_index": 2}
-      ],
-      "args": [
-        {"name": "arg0", "arg_index": 0, "role": "input",
-         "shape": [10, 512], "dtype": "float16",
-         "layout": {"stick_size": [64], "padding": [0, 0]}},
-        {"name": "arg1", "arg_index": 1, "role": "input",
-         "shape": [10, 512], "dtype": "float16",
-         "layout": {"stick_size": [64], "padding": [0, 0]}},
-        {"name": "buf0", "arg_index": 2, "role": "output",
-         "shape": [10, 512], "dtype": "float16",
-         "layout": {"stick_size": [64], "padding": [0, 0]}}
-      ]
-    }
+  "symbol_kinds": [
+    {"kind": "kernel", "arg_index": 0},
+    {"kind": "kernel", "arg_index": 1},
+    {"kind": "kernel", "arg_index": 2}
+  ],
+  "args": [
+    {"arg_index": 0, "role": "input", "shape": [10, 512], "dtype": "float16",
+     "layout": {"stick_size": [64], "padding": [0, 0]}},
+    {"arg_index": 1, "role": "input", "shape": [10, 512], "dtype": "float16",
+     "layout": {"stick_size": [64], "padding": [0, 0]}},
+    {"arg_index": 2, "role": "output", "shape": [10, 512], "dtype": "float16",
+     "layout": {"stick_size": [64], "padding": [0, 0]}}
   ]
 }
 ```
 
+Two classes of field. **Required** fields are what a launch cannot be constructed
+without; a consumer that finds one missing should refuse rather than guess.
+**Advisory** fields are recorded for diagnostics and validation — a consumer may
+report on them, but launch behaviour must never depend on their presence, so an
+older spec that omits them still launches.
+
+| Field | | Why |
+|---|---|---|
+| `version` | required | schema evolution; refuse an unknown major |
+| `args[].arg_index` | required | the binding is positional — this *is* the contract |
+| `args[].shape` | required | host shape; recorded nowhere in the artifacts |
+| `args[].dtype` | required | host dtype; likewise absent |
+| `args[].role` | required | the kernel signature has no output category |
+| `kernel_name` | required | which kernel this spec describes |
+| `pool_size` | required | decides whether the pool tensor is prepended |
+| `symbol_kinds` | required *when non-empty* | needed for `kAddress` binding; absent means none |
+| `bundle_symbolic_args` | required | a `false` folder is out of scope and must be refused, not launched |
+| `args[].layout` | advisory | lets a validator check stick alignment before touching hardware |
+| `emitter` | advisory | only as a diagnostic information |
+| `symbols` | advisory, required *when symbolic dims exist* | see below |
+
+There is deliberately no per-argument `name`. Binding is positional by
+`arg_index`, so a name is a label rather than part of the contract, and recording
+one invites the impression that naming is meaningful. `kernel_name` is kept
+because it identifies the spec itself.
+
+One file per `spyreCodeDir/` rather than one per folder with a `kernels` array:
+nothing in tree today produces several `spyreCodeDir`s under one logical compile,
+so `spyre launch --list` can glob for sibling specs if that case ever appears.
+
 Field notes:
 
-* `args` is ordered by `arg_index`, matching the MLIR `input_arg` slot order
-  described at `kernel_runner.py:92-95`. The pool parameter, when
-  `symbol_kinds[0].is_pool`, is **not** an entry in `args`; it is implied by
-  `pool_size > 0` and prepended by the launcher exactly as `call_kernel` does.
-  This keeps `arg_index` meaning the same thing it means in the compiler.
+* `args` is ordered by `arg_index`, the positional order in which the launcher
+  passes tensors to `run()`. Note the compiled kernel makes no distinction
+  between inputs and outputs in its argument list — the output occupies a normal
+  argument slot — which is why `role` has to be recorded here and cannot be
+  recovered at launch. The pool parameter, when present, is **not** an entry in
+  `args`; it is implied by `pool_size > 0` and prepended by the launcher exactly
+  as `call_kernel` does.
 * `role` is one of `input`, `output`, `input_output`, closing the in-place gap.
 * `dtype` uses full torch names (`float16`), not the CLI's short forms, so the
   schema is not limited to the three-entry `dtype_mapping` at `core.py:28-32`.
-* `layout` is optional and advisory for launch, but is what lets a future
-  validator check stick alignment before touching hardware.
+* `layout` is advisory: a launch does not need it, but it is what a future
+  validator would use to check stick alignment before touching hardware.
 * `symbol_kinds` is serialized from the same list `generate_bundle()` returns,
-  so the CLI can finally construct the runner with its fourth parameter.
+  reusing the `symbol_kinds.json` encoding described below, so the CLI can
+  construct the runner with its fourth parameter.
+* `bundle_symbolic_args` is recorded but spec-driven launch covers the `True`
+  case only, which is the only mode a production compile exercises. A
+  baked-address folder is then rejected with a clear message instead of failing
+  deep in the generator; those stay a debugging path through the OpSpec Lab
+  script, which already handles them via `pin_bundle_symbolic_args`.
 
 Symbolic dimensions get a `symbols` block per kernel, with `shape` entries
 allowed to name a symbol instead of an integer:
 
 ```json
 "symbols": {"s0": {"min": 1, "max": 256}},
-"args": [{"name": "arg0", "arg_index": 0, "role": "input",
+"args": [{"arg_index": 0, "role": "input",
           "shape": ["s0", 512], "dtype": "float16"}]
 ```
 
@@ -210,30 +239,17 @@ Binding them at launch stays explicit: `spyre launch --bind s0=128 <folder>`.
 
 ### KTIR extension
 
-The spec is emitter-neutral by construction. A KTIR folder sets
-`"emitter": "ktir"` and points `code_dir` at the `<kernel>.ktir` artifact
-written by `async_compile.ktir` (`execution/async_compile.py:456`) together with
-its DBO-compiled output. The `args`, `role`, `shape`, `dtype`, and `symbols`
-fields carry over unchanged, because they describe the kernel's interface rather
-than the artifact format.
+The spec needs no KTIR-specific fields, because both emitters converge on the
+same loadable artifact: a `spyreCodeDir/` holding `spyrecode.json` and
+`init_binary.bin`. Whatever each emitter writes on the way there is a
+compiler-stage detail that no launcher opens, so `code_dir` always names that
+folder and the `args`, `role`, `shape`, `dtype`, and `symbols` fields carry over
+unchanged — they describe the kernel's interface, not how it was built.
 
-Two KTIR-specific facts must be recorded rather than inferred, both consequences
-of constraints that already exist:
-
-* `emitter` is not convertible after the fact. Emitter choice is fixed at
-  capture time; KTIR requires per-buffer names under `config.ktir_emitter`, and
-  KTIR artifacts may carry baked addresses the SDSC generator rejects. Writing
-  `emitter` into the spec makes a mismatched launch a clear error instead of a
-  confusing generator failure.
-* KTIR device lowering needs `config.ktir_device_mlir`
-  (`KTIR_DEVICE_MLIR`, `config.py:84`), checked by
-  `_check_ktir_device_prerequisites` (`async_compile.py:63-71`). The spec
-  records that the folder was built expecting it, so the CLI can fail with a
-  precise message rather than a missing-dialect traceback.
-
-A `"emitter": "ktir"` folder is therefore launchable through the same
-`spyre launch` command, with the runner selection — not the input parsing —
-being the only thing that branches.
+A KTIR-built folder is therefore launchable through the same `spyre launch`
+command with no change to input parsing. This is the reason to define the schema
+now rather than after KTIR folders become common: there is one contract to
+specify, not one per emitter.
 
 ### Changes to spyre-cli
 
@@ -290,15 +306,6 @@ path in `_inductor/codegen/bundle.py` for `generate_bundle()`, and
 `execution/async_compile.py` for the KTIR path, both writing through one shared
 serializer so the two emitters cannot drift.
 
-* **Stage 0** — the argument-count check requested on #4077 and never landed.
-  This needs no spec at all and should not wait for one: compare
-  `len(tensors)` against the external-I/O argument count the prepared jobplan
-  expects, and fail before launching. It requires exposing that count on
-  `JobPlan`, which `torch_spyre/_C.pyi:395-415` does not yet do (it exposes
-  `num_steps`, `job_allocation_size`, `get_step_type`, `get_step_name`), so the
-  cost is one small C++ accessor. This catches the worst case — wrong number of
-  tensors — independently of everything below, and is worth landing first even
-  if the rest of this RFC is rejected.
 * **Stage 1** — schema plus serializer, written behind a config flag; a spec is
   emitted but nothing consumes it. Unblocks review of the field set against
   real folders.
@@ -310,6 +317,32 @@ serializer so the two emitters cannot drift.
 * **Stage 4** — KTIR emitter support and `kernel_provenance` plumbing for
   profiler joins.
 
+### Precedent: `symbol_kinds.json`
+
+This pattern — the compiler writing a small JSON file beside `spyreCodeDir/`,
+read back by a process that did not compile the kernel — already exists in the
+repo. `save_symbol_kinds` (`kernel_cache.py:463`) writes `symbol_kinds.json`
+next to the folder, and `load_symbol_kinds(cached_dir)`
+(`async_compile.py:358`) reads it cold on a cache hit. For the `add` above it is
+468 bytes:
+
+```json
+[{"kind": "kernel", "base_sym_idx": -1, "offset": 0, "arg_index": 0, ...},
+ {"kind": "kernel", "base_sym_idx": -1, "offset": 0, "arg_index": 1, ...},
+ {"kind": "kernel", "base_sym_idx": -1, "offset": 0, "arg_index": 2, ...}]
+```
+
+Two things follow. First, the approach is proven in tree rather than novel, and
+its serialization — `dataclasses.asdict` per entry with `kind` as the
+discriminator — is the obvious one for the spec to reuse for `symbol_kinds`
+instead of inventing a second encoding. Second, it is **not** a launch spec and
+does not overlap with one: it carries no shape, dtype, role, or name, so it
+cannot tell a caller what tensors to build. The two files are complementary.
+
+It is also written only when `SPYRE_KERNEL_CACHE=1` (`config.py:310`, default
+`0`), so a `spyre-cli` user does not normally have even this much. The Launch
+Spec should be emitted on the ordinary compile path, not behind a cache flag.
+
 The OpSpec Lab can be updated to emit a `launch_spec.json` alongside its replay
 script, from the same `SHAPES`/`LAYOUTS`/`POOL_SIZE` record it already builds
 (`capture.py:418-435`). The declarative spec and the executable script serve
@@ -318,8 +351,6 @@ replaces the other.
 
 ## **Metrics**
 
-* Argument-count mismatches fail with a diagnostic instead of launching: today
-  0%, target 100% (Stage 0, independent of the spec).
 * Shape/dtype mismatches fail with a diagnostic instead of launching: today 0%,
   target 100% for folders carrying a spec.
 * Shapes retyped by a user to launch a folder: from every invocation to zero.
@@ -345,15 +376,22 @@ replaces the other.
 
 ## **Alternatives**
 
-* **Query the compiled artifacts at launch.** Have the CLI parse
-  `spyrecode.json` / `bundle.mlir` directly and infer the interface, the
-  reconstruct-the-launch-plan approach described in the Summary, so no new file
-  is needed. This is the most appealing alternative: single source of
-  truth, nothing to keep in sync. Rejected for now because it puts a second
-  MLIR/SDSC parser into the Python path and re-derives what the compiler
-  already knew; the existing `spyrecode.json` carries `JobPreparationPlan` and
-  `JobExecPlan` (`tests/test_prepare_kernel.py:158-171`), not host dtypes or
-  argument roles. Reconsider if the emitted spec proves hard to keep truthful.
+* **Infer the interface from `spyrecode.json` at launch.** Have the CLI parse
+  the loaded artifact itself, so no new file is needed — appealing because it
+  keeps one source of truth with nothing to sync. Rejected because the
+  information is not there. Inspected on a pod, the `add` folder's
+  `spyrecode.json` has exactly two top-level keys, `JobPreparationPlan` and
+  `JobExecPlan` — the steps to execute (`Allocate`, `InitTransfer`,
+  `ComputeOnHost`, `DataTransfer`, `ComputeOnDevice`) — with no `dtype`, `role`
+  or `arg_index` anywhere in the file. The shapes it does carry are device-side
+  and tiled: `input_shape_: [128, 32]` / `output_shape_: [128, 1, 32]` for a
+  `[10, 512]` host tensor, so the host shape cannot be recovered by inverting
+  them. Note this is the
+  *only* artifact available to a post-compile launcher: `prepare_kernel` reads
+  `spyrecode.json` and `init_binary.bin` and nothing else
+  (`prepare_kernel.cpp:226-238`), which is also why the earlier compiler-stage
+  artifacts are not an option here. Reconsider only if the host-side fields are
+  ever added to `spyrecode.json` itself, which would make this RFC unnecessary.
 * **Extend the OpSpec Lab to cover launching.** It already has the data, but a
   capture run is a heavier prerequisite than an ordinary compile, and its
   artifact is executable Python — a fine debugging vehicle, a poor input
@@ -372,6 +410,12 @@ To resolve through the RFC process:
 * Is one spec per folder with a `kernels` array right, or one spec per
   `spyreCodeDir`? The array makes `--list` natural but adds a merge step when
   kernels are compiled independently and possibly concurrently.
+
+Scope of what has been verified: the evidence above comes from one static
+`[10, 512]` fp16 `add`. Pool-allocated and `kernel_slice`/`kernel_derived`
+bundles, multi-kernel folders, symbolic dimensions and in-place arguments are
+design in this RFC, not observation, and should be confirmed against real
+folders during Stage 1.
 
 To resolve during implementation:
 

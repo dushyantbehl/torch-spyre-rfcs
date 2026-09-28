@@ -194,12 +194,14 @@ older spec that omits them still launches.
 | `args[].dtype` | required | host dtype; likewise absent |
 | `args[].role` | required | the kernel signature has no output category |
 | `kernel_name` | required | which kernel this spec describes |
-| `pool_size` | required | decides whether the pool tensor is prepended |
+| `pool_size` | required | size of the *caller-supplied* pool argument; default to `0` when the caller passes none |
 | `symbol_kinds` | required *when non-empty* | needed for `kAddress` binding; absent means none |
 | `bundle_symbolic_args` | required | a `false` folder is out of scope and must be refused, not launched |
-| `args[].layout` | optional | lets a validator check stick alignment before touching hardware |
+| `args[].layout` | required | part of the execution contract; omitted only for the default arrangement |
+| `symbols` | required *when symbolic dims exist* | see below |
 | `emitter` | optional | diagnostic only |
-| `symbols` | optional, required *when symbolic dims exist* | see below |
+
+We can provide reasonable defaults for some fields like `args[].layout`.
 
 There is deliberately no per-argument `name`. Binding is positional by
 `arg_index`, so a name is a label rather than part of the contract, and recording
@@ -216,17 +218,31 @@ Field notes:
   passes tensors to `run()`. Note the compiled kernel makes no distinction
   between inputs and outputs in its argument list — the output occupies a normal
   argument slot — which is why `role` has to be recorded here and cannot be
-  recovered at launch. The pool parameter, when present, is **not** an entry in
-  `args`; it is implied by `pool_size > 0` and prepended by the launcher exactly
-  as `call_kernel` does.
+  recovered at launch. The pool parameter, when the caller must supply one, is
+  The pool is never listed in `args`. When `pool_size > 0`, the launcher creates
+  the pool tensor itself and passes it first, before the `args` entries, the same
+  way `call_kernel` does.
+
+* `pool_size` is the size in bytes of the pool tensor the caller must pass,
+  and `0` means the caller passes nothing, which is the case for SDSC bundles that
+  carry their own scratchpad initialization.
+
 * `role` is one of `input`, `output`, `input_output`, closing the in-place gap.
+
 * `dtype` uses full torch names (`float16`), not the CLI's short forms, so the
   schema is not limited to the three-entry `dtype_mapping` at `core.py:28-32`.
-* `layout` is optional: a launch does not need it, but it is what a future
-  validator would use to check stick alignment before touching hardware.
+
+* `layout` is part of the execution contract: a spec consumer constructs or
+  validates each tensor against the arrangement the compiled kernel expects.
+  We can omit passing the value for layout when the compiler and the consumer have
+  pre-agreed a default (standard stick tiling for the recorded `shape` and `dtype`,
+  no padding beyond stick rounding), **and** the producer has established that the
+  kernel accepts it.
+
 * `symbol_kinds` is serialized from the same list `generate_bundle()` returns,
   reusing the `symbol_kinds.json` encoding described below, so the CLI can
   construct the runner with its fourth parameter.
+
 * `bundle_symbolic_args` is recorded but spec-driven launch covers the `True`
   case only, which is the only mode a production compile exercises. A
   baked-address folder is then rejected with a clear message instead of failing
@@ -454,8 +470,13 @@ To resolve during implementation:
 * Exact serialization of the five `SymbolKind` variants (`kernel`,
   `kernel_slice`, `kernel_derived`, `kernel_derived_symbolic`, pool) described
   at `codegen/compute_ops.py:36-53`.
-* Whether `input_output` aliasing needs an explicit `aliases` field or is
-  adequately expressed by a shared `name`.
+* The precise default `layout`, written down tightly enough that a producer can
+  decide whether a given argument takes it and a consumer can reconstruct it from
+  `shape` and `dtype` alone. Until that is pinned, producers should emit `layout`
+  explicitly for every argument rather than rely on omission.
+* Whether `input_output` aliasing needs an explicit `aliases` field, now that the
+  per-argument `name` that might have expressed it implicitly is gone; a pair of
+  `arg_index` values is the likely spelling.
 * How `--bind` interacts with `bundle_symbolic_args` and with symbolic dims
   already baked into the bundle.
 
